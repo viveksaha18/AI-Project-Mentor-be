@@ -4,10 +4,19 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from database import engine, get_db
-from models import Project
-from schemas import ProjectCreate, ProjectResponse, ProjectUpdate
-
-
+from models import Project, Task, AIInteraction
+from schemas import (
+    AIInteractionResponse,
+    AIPlanRequest,
+    ProjectCreate,
+    ProjectResponse,
+    ProjectUpdate,
+    TaskCreate,
+    TaskResponse,
+    TaskStatusUpdate,
+    TaskUpdate,
+)
+from ollama_service import (OllamaServiceError, generate_ai_response)
 app = FastAPI(
     title="AI Project Mentor API",
     description=(
@@ -192,3 +201,119 @@ def delete_project(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Project could not be deleted.",
         ) from error
+
+# ---------------------------------------------------------
+# AI Mentor endpoints
+# ---------------------------------------------------------
+
+@app.post(
+    "/api/ai/plan",
+    response_model=AIInteractionResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["AI Mentor"],
+)
+def generate_project_plan(
+    request_data: AIPlanRequest,
+    db: Session = Depends(get_db),
+):
+    project = db.get(
+        Project,
+        request_data.project_id,
+    )
+
+    if project is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Project with ID "
+                f"{request_data.project_id} was not found."
+            ),
+        )
+
+    task_statement = (
+        select(Task)
+        .where(
+            Task.project_id == request_data.project_id
+        )
+        .order_by(Task.task_id)
+    )
+
+    existing_tasks = db.scalars(
+        task_statement
+    ).all()
+
+    try:
+        ai_result = generate_ai_response(
+            project_name=project.project_name,
+            project_description=project.description,
+            technology_stack=project.technology_stack,
+            existing_tasks=existing_tasks,
+            task_type=request_data.task_type,
+            user_prompt=request_data.prompt,
+        )
+
+    except OllamaServiceError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(error),
+        ) from error
+
+    interaction = AIInteraction(
+        project_id=project.project_id,
+        task_type=request_data.task_type,
+        prompt=request_data.prompt,
+        ai_response=ai_result["answer"],
+        model_name=ai_result["model"],
+    )
+
+    try:
+        db.add(interaction)
+        db.commit()
+        db.refresh(interaction)
+
+        return interaction
+
+    except SQLAlchemyError as error:
+        db.rollback()
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "The AI response was generated, "
+                "but it could not be saved."
+            ),
+        ) from error
+
+
+@app.get(
+    "/api/ai/history/{project_id}",
+    response_model=list[AIInteractionResponse],
+    tags=["AI Mentor"],
+)
+def get_ai_history(
+    project_id: int,
+    db: Session = Depends(get_db),
+):
+    project = db.get(Project, project_id)
+
+    if project is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project with ID {project_id} was not found.",
+        )
+
+    history_statement = (
+        select(AIInteraction)
+        .where(
+            AIInteraction.project_id == project_id
+        )
+        .order_by(
+            AIInteraction.created_at.desc()
+        )
+    )
+
+    interactions = db.scalars(
+        history_statement
+    ).all()
+
+    return interactions
